@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Observe exact publisher thread CPU and optionally add capacity to an existing,
+  verified publisher Auto Scaling group using normal ASG health. No publisher
+  lifecycle, separate readiness adapter, or scale-in.
+
+Parameters:
+  AutoScalingGroupName:
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    Description: Existing publisher group with verified registration and routing.
+  PublisherInstanceRoleName:
+    Type: String
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[A-Za-z0-9_+=,.@-]+'
+    Description: Existing EC2 instance IAM role receiving the thread metric publication grant.
+  ControllerCodeBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    Description: S3 bucket in this Region containing the controller ZIP.
+  ControllerCodeKey:
+    Type: String
+    MinLength: 1
+    Description: S3 object key for ZIP containing scaling_controller.py at its root.
+  ControllerCodeVersion:
+    Type: String
+    Default: ''
+    Description: Optional immutable S3 object version for the controller ZIP.
+  EnableScaling:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Enable only after lifecycle, metric, routing, and latency qualification.
+  EarlyCPUThreshold:
+    Type: Number
+    MinValue: 1
+    MaxValue: 100
+    Default: 70
+    Description: Hottest publisher thread CPU percent of one vCPU, two periods.
+  UrgentCPUThreshold:
+    Type: Number
+    MinValue: 1
+    MaxValue: 100
+    Default: 80
+    Description: Hottest publisher thread CPU percent of one vCPU, one period.
+  SpareCPUThreshold:
+    Type: Number
+    MinValue: 1
+    MaxValue: 100
+    Default: 40
+    Description: Healthy InService publishers below this thread CPU count as spare headroom.
+  CooldownSeconds:
+    Type: Number
+    MinValue: 60
+    Default: 300
+    Description: Minimum capacity request interval; tune to launch-to-health-and-metrics time.
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional existing SNS topic ARN for alerts; never a scaling action.
+
+Conditions:
+  HasCodeVersion: !Not [!Equals [!Ref ControllerCodeVersion, '']]
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  PublisherMetricPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      # Stack UUID avoids collisions when multiple groups share an instance role.
+      PolicyName: !Join
+        - '-'
+        - - NPAPublisherThreadMetrics
+          - !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      Roles:
+        - !Ref PublisherInstanceRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: '*'
+            Condition:
+              StringEquals:
+                cloudwatch:namespace: NPA/Publisher
+
+  ControllerState:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AutoScalingGroupName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AutoScalingGroupName
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  ControllerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}/publisher-thread-scaling
+      RetentionInDays: 30
+
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublisherThreadController
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # These read APIs do not support resource-level permissions.
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribePolicies
+                  - autoscaling:DescribeScheduledActions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - autoscaling:SetDesiredCapacity
+                Resource: !Sub arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingGroupName}
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ControllerState.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: NPA/Autoscaling
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ControllerLogGroup.Arn
+
+  ScalingController:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Maintain healthy publisher headroom using exact hottest-thread CPU.
+      Runtime: python3.12
+      Handler: scaling_controller.lambda_handler
+      MemorySize: 128
+      Timeout: 45
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt ControllerRole.Arn
+      Code:
+        S3Bucket: !Ref ControllerCodeBucket
+        S3Key: !Ref ControllerCodeKey
+        S3ObjectVersion: !If [HasCodeVersion, !Ref ControllerCodeVersion, !Ref 'AWS::NoValue']
+      LoggingConfig:
+        LogGroup: !Ref ControllerLogGroup
+      Environment:
+        Variables:
+          AUTO_SCALING_GROUP_NAME: !Ref AutoScalingGroupName
+          STATE_TABLE_NAME: !Ref ControllerState
+          ENABLE_SCALING: !Ref EnableScaling
+          EARLY_CPU_THRESHOLD: !Ref EarlyCPUThreshold
+          URGENT_CPU_THRESHOLD: !Ref UrgentCPUThreshold
+          SPARE_CPU_THRESHOLD: !Ref SpareCPUThreshold
+          COOLDOWN_SECONDS: !Ref CooldownSeconds
+
+  ControllerAsyncInvocation:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ScalingController
+      Qualifier: '$LATEST'
+      MaximumEventAgeInSeconds: 60
+      MaximumRetryAttempts: 0
+
+  ControllerSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Reevaluate current publisher membership and complete CPU periods.
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Id: PublisherThreadController
+          Arn: !GetAtt ScalingController.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 60
+            MaximumRetryAttempts: 0
+
+  ControllerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ScalingController
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ControllerSchedule.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  MissingTelemetryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Current publishers lack usable exact-thread CPU or collector health telemetry.
+      Namespace: NPA/Autoscaling
+      MetricName: MissingTelemetry
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  AtCapacityLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Required healthy headroom is unavailable at the group's maximum capacity.
+      Namespace: NPA/Autoscaling
+      MetricName: AtCapacityLimit
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  UrgentCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Hottest publisher thread has reached the urgent CPU threshold.
+      Namespace: NPA/Autoscaling
+      MetricName: HottestPublisherCPU
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref UrgentCPUThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  ControllerHeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Controller produced no decision for three consecutive minutes.
+      Namespace: NPA/Autoscaling
+      MetricName: ControllerHeartbeat
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # Absence is itself failure for the heartbeat, unlike CPU observations.
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  CapacityTransitionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Capacity launch or replacement has suppressed scaling for fifteen minutes.
+      Namespace: NPA/Autoscaling
+      MetricName: CapacityTransition
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroupName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 15
+      DatapointsToAlarm: 15
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  ControllerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Controller execution failed; inspect the controller log group.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScalingController
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+Outputs:
+  ControllerFunctionName:
+    Description: Scheduled controller Lambda function name.
+    Value: !Ref ScalingController
+  StateTableName:
+    Description: Retained controller state; preserve cooldown when replacing this stack.
+    Value: !Ref ControllerState
+  ControllerLogGroupName:
+    Value: !Ref ControllerLogGroup
+  PublisherMetricNamespace:
+    Description: Collector metrics use AutoScalingGroupName and InstanceId dimensions.
+    Value: NPA/Publisher
+  ControllerMetricNamespace:
+    Description: Diagnostic metrics use only the AutoScalingGroupName dimension.
+    Value: NPA/Autoscaling
+  ObservedAutoScalingGroupName:
+    Value: !Ref AutoScalingGroupName
