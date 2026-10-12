@@ -64,13 +64,13 @@ def _valid_cpu(value):
 def _valid_samples(samples):
     if not samples:
         return False
-    for field in ("cpu", "ready", "healthy", "count"):
+    for field in ("cpu", "healthy", "count"):
         values = samples.get(field, [])
         if len(values) != 2:
             return False
         if any(not _valid_cpu(value) for value in values):
             return False
-        if field in ("ready", "healthy") and values != [1, 1]:
+        if field == "healthy" and values != [1, 1]:
             return False
         if field == "count" and min(values) < EXPECTED_SAMPLES_PER_MINUTE:
             return False
@@ -142,7 +142,6 @@ def _metric_queries(group_name, members):
         for suffix, field, name, statistic, unit in (
             ("c", "cpu", "HottestThreadCPU", "Maximum", "Percent"),
             ("h", "healthy", "CollectorHealthy", "Minimum", "Count"),
-            ("r", "ready", "PublisherReady", "Minimum", "Count"),
             ("n", "count", "CollectorHealthy", "SampleCount", "Count"),
         ):
             metric_id = f"m{index}{suffix}"
@@ -173,7 +172,7 @@ def read_telemetry(cloudwatch, group_name, members, end):
     """Read only exact, complete, closed periods for current healthy members."""
     periods = [end - timedelta(minutes=2), end - timedelta(minutes=1)]
     telemetry = {instance: {} for instance in members}
-    # GetMetricData accepts at most 500 queries. Each member uses four.
+    # GetMetricData accepts at most 500 queries. Each member uses three.
     for offset in range(0, len(members), 100):
         next_offset = offset + 100
         queries, identifiers = _metric_queries(group_name, members[offset:next_offset])

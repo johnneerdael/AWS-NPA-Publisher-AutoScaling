@@ -26,7 +26,7 @@ if __name__ == "__main__":
             "scan",
             "--all-files",
             "--exclude-files",
-            r"(^|/)(?:\.git/|\.secrets\.baseline$)",
+            r"(^|/)(?:\.git/|dist/|build/|\.secrets\.baseline$)",
         ],
         cwd=root,
         check=True,

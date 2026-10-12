@@ -105,6 +105,30 @@ class ThreadScalingTemplateTests(unittest.TestCase):
         self.assertEqual(invocation["MaximumEventAgeInSeconds"], 60)
         self.assertEqual(invocation["MaximumRetryAttempts"], 0)
 
+    def test_publisher_metrics_grant_attaches_only_to_selected_existing_role(self):
+        parameter = self.template["Parameters"]["PublisherInstanceRoleName"]
+        self.assertEqual(parameter["Type"], "String")
+        self.assertEqual(parameter["MinLength"], 1)
+        self.assertEqual(parameter["MaxLength"], 64)
+        self.assertNotIn("Default", parameter)
+        policy = self.resource("AWS::IAM::Policy")["Properties"]
+        self.assertEqual(policy["Roles"], [{"Ref": "PublisherInstanceRoleName"}])
+        self.assertNotIn("Users", policy)
+        self.assertNotIn("Groups", policy)
+        self.assertEqual(
+            policy["PolicyDocument"]["Statement"],
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": ["cloudwatch:PutMetricData"],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {"cloudwatch:namespace": "NPA/Publisher"}
+                    },
+                }
+            ],
+        )
+
     def test_role_can_only_scale_selected_group_and_write_diagnostic_namespace(self):
         role = self.resource("AWS::IAM::Role")["Properties"]
         self.assertNotIn("ManagedPolicyArns", role)

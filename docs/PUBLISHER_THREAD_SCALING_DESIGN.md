@@ -1,82 +1,67 @@
-# Preventive publisher thread autoscaling
+# Preventive exact publisher CPU autoscaling
 
-## Purpose and accepted constraints
+## Requirements
 
-Prevent outages caused by the busiest publisher saturating its traffic-handling
-thread. Measure the busiest publisher thread relative to one vCPU. Ignore spare
-cores and fleet-average CPU as scaling triggers. Keep sticky sessions on their
-current publisher and provision headroom for new connections before saturation.
-Use 70% as the early threshold and 80% as the urgent threshold, configurable.
+Prevent outages from the busiest publisher saturating its traffic-handling
+thread. Use direct thread CPU relative to one vCPU at 70% early and 80% urgent.
+Never use two-core or fleet averages, EC2 instance CPU, or CPU-count multiplication
+to infer the signal. Keep existing sticky clients connected and add headroom
+for new connections. Publish logical CPU readings separately for inspection.
 
-## Architecture
+Provision host metric collection through cloud-init during publisher launch.
+Change no publisher binary or Docker image. Use the existing launch/registration
+workflow and ordinary ASG health; require no separate tenant-specific eligibility
+checker, readiness marker, or expiring eligibility proof.
 
-Attach a new, scale-out-only controller to an existing, verified publisher Auto
-Scaling group. Keep publisher registration, app assignment, and termination in
-the existing lifecycle integration. The upstream checked-in Lambda source and
-ZIP do not implement the advertised registration workflow; do not silently
-reuse them or invent unverified Netskope API contracts.
+## Components
 
-A Linux sidecar samples each thread under /proc for exactly one explicitly
-selected publisher executable. Compute 100 * delta(user + system CPU seconds)
-/ delta(monotonic seconds), with no division by CPU count. Publish the hottest
-thread CPU, collector health, and registration readiness per instance every
-10 seconds. Require six health samples in each closed minute, never fabricated
-zeros or bursts of catch-up samples. Unknown new-thread baselines are unhealthy. Bind readiness to the selected process PID and start time; mark it
-only after the lifecycle integration has verified Netskope registration and
-application eligibility. Expire the proof after 180 seconds and renew from an
-actual eligibility verifier every 60 seconds. Require re-marking after restart.
+A Linux collector selects exactly one publisher executable on the host,
+optionally restricted to a Docker container. Sample each current thread's
+user/system CPU counters against monotonic time. A new or reused thread needs a
+baseline; missing or invalid measurements never become zero CPU. Per-CPU Linux
+counters are separate observations and never averaged. Send actual hottest-thread
+CPU and collector health every 10 seconds, preserving timestamps and skipping
+missed intervals rather than publishing catch-up bursts.
 
-A scheduled Lambda runs every minute. Read only current ASG members and complete
-one-minute CloudWatch periods; reject stale, missing, invalid, or unready samples
-as usable headroom. At 70% reached in each of two periods, maintain at least one
-ready publisher below 40% CPU. At 80% for one period, maintain at least two.
-The highest individual publisher CPU triggers the rule, never an average.
-Existing cool eligible publishers count as headroom; this includes currently
-eligible publishers, not just instances newly launched by the controller. Persistent hot sticky
-publishers do not trigger more launches while sufficient headroom exists.
+A scheduled Lambda checks current ASG members and both newest closed minutes.
+Require six health samples per minute, healthy measurement minima, and CPU maxima.
+At 70% reached in both minutes, maintain one healthy InService publisher below 40%.
+At 80% in the latest minute, maintain two. Existing cool publishers count as
+headroom; sticky hot sessions cannot cause unlimited launches while that headroom
+exists. Use normal existing launch/registration gates before InService.
 
-Suppress additional requests while capacity is launching, telemetry/readiness
-is incomplete, or a durable cooldown is active. Use DynamoDB conditional state
-updates and Lambda reserved concurrency to serialize capacity requests. Respect
-ASG maximum capacity and emit diagnostic metrics for missing telemetry and
-insufficient headroom at the limit. Reject existing scaling policies and scheduled actions so an old
-average-CPU scale-in policy cannot undo the new controller. Re-read capacity after reserving cooldown and cancel if it changed. Require the
-controller to be the exclusive capacity writer; AWS has no conditional capacity
-update. Never intentionally reduce desired capacity. Deployment defaults to observation-only until integration is verified.
+Suppress requests during launch/replacement, incomplete telemetry, and durable
+cooldown. Serialize writes, honor the maximum, reject other policies/schedules,
+and recheck desired/min/max before the write. Require exclusive capacity ownership
+because AWS offers no compare-and-set operation. Never intentionally scale in.
+Emit diagnostics and alarms for missing data, controller failure, stuck capacity
+transition, heartbeat loss, urgent CPU, and insufficient capacity at the limit.
 
-## Scope and limits
+Cloud-init embeds the reviewed collector, JSON config, and systemd unit. Install
+runtime dependencies and start metrics at boot. Generate deterministic compressed
+EC2 user data, enforce the raw size limit, preserve existing cloud-config keys
+and bootstrap commands, and reject path/list conflicts. Expose launch-template
+JSON without silently replacing existing script or MIME bootstrap.
 
-Do not deploy to AWS or change tenant applications in this work. Deliver source,
-a CloudFormation add-on, local installation and packaging tools, tests, CI, and
-an operator guide in the fork. Do not claim registration, routing, latency,
-load handling, or session draining has been production-qualified. Traffic
-must reach cool publishers for spare capacity to help. CPU thresholds require
-qualification against actual launch-to-ready time and CPU growth. Scale-in
-remains an explicit drained maintenance operation.
+CloudFormation deploys the controller against an existing ASG and attaches a
+namespace-scoped publishing policy to the existing publisher instance role.
+Default to observation mode. No AWS mutation or guest installation is performed
+as part of source development.
 
-## Implementation units
+## Implementation and verification
 
-- [x] Collector: scripts/publisher_metrics.py, scripts/install-thread-metrics.sh,
-      requirements.txt, tests/test_publisher_metrics.py. Test first: single-core
-      units, hottest thread selection, CPU migration independence, process and
-      thread restart, missing/ambiguous processes, readiness process binding,
-      no fabricated zero CPU on read errors, metric dimensions.
-- [x] Controller: scripts/controller/scaling_controller.py,
-      tests/test_scaling_controller.py. Test first: busiest publisher triggers
-      despite low average, 70/80 persistence, available spare suppression,
-      pending/readiness/freshness gating, cooldown/concurrency, maximum capacity,
-      dry run, conflicting policy rejection, SDK adapter calls and error paths.
-- [x] Infrastructure: templates/publisher-thread-scaling.yaml,
-      tests/test_thread_scaling_template.py. Integrate scheduled controller,
-      scoped IAM, retained state, alarms, safe defaults, artifact inputs.
-- [x] Integration: README and deployment guide, artifact packaging, enforce
-      tests/lint/security/template checks in CI. Verify a synthetic Linux
-      publisher process and review the complete change before publishing.
+- [x] Collector: exact busiest-thread units, Docker/process selection, restart and
+      migration behavior, independent per-CPU observations, sparse/error handling.
+- [x] Controller: busiest-publisher thresholds, sticky headroom, normal ASG health,
+      complete sample counts, launch transitions, limits, cooldown and writer races.
+- [x] Infrastructure: namespace-scoped host permission, scoped controller IAM,
+      retained state, scheduler, alarms, source artifact inputs, safe default.
+- [x] Provisioning: cloud-init source embedding, preserved bootstrap, service startup,
+      deterministic gzip/launch-template JSON, raw EC2 user-data limit.
+- [x] Validation: Python and SDK adapter tests, Linux procfs CI, CloudFormation lint,
+      formatting, security, secret scans, shell syntax, packaging and source review.
 
-## Verification
-
-Run Python unit and adapter tests, Linux collector smoke tests in CI, cfn-lint,
-Black/Flake8/Bandit, secret detection, and git diff --check. Inspect the resulting
-artifact and deployment parameters. Production acceptance requires real AWS
-metrics, verified publisher eligibility, new-connection distribution, fault
-injection, and measured provisioning latency before enabling scaling.
+Read-only Frankfurt checks establish idle process-layout compatibility and
+cloud-init schema acceptance, not fresh-boot or loaded qualification. Before
+capacity writes, verify actual provisioning, registration, current fleet metrics,
+new-client distribution, detection/provisioning latency, and failure behavior.

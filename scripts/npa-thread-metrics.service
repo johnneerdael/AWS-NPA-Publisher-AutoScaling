@@ -1,0 +1,22 @@
+[Unit]
+Description=Publisher thread and individual CPU metrics
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/npa-thread-metrics/venv/bin/python /opt/npa-thread-metrics/publisher_metrics.py --config /etc/npa-thread-metrics.json
+Restart=always
+RestartSec=10
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

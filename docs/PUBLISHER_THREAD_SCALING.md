@@ -1,181 +1,159 @@
-# Deploy and qualify preventive thread scaling
+# Provision and deploy exact publisher thread scaling
 
-## Operating model
+## Signal and policy
 
-Use this add-on with an existing publisher Auto Scaling group whose AMI,
-registration, application assignment, and launch lifecycle already work. Use
-instance-count desired capacity and one publisher per instance; mixed weighted
-or vCPU/memory capacity groups are outside this controller's model.
+Measure the actual busiest publisher thread, not EC2 instance averages or a
+scaled approximation. Compute 100 times its user+system CPU-time delta divided
+by monotonic elapsed time. One fully occupied vCPU is 100%, independent of the
+machine's CPU count or scheduler migration. Select exactly one publisher
+executable, optionally within a named Docker container; do not monitor the
+watchdog, diagnostic server, or entire container as the publisher.
 
-The busiest publisher's hottest thread is the trigger. At 70% for two closed
-one-minute periods, require one ready publisher at or below 40% CPU. At 80% in
-the latest closed minute, require two. Count publishers below 40% for both
-periods as spare headroom; no second idle core contributes to this count.
+The collector also emits `CPUCoreUtilization` separately for every logical CPU,
+with a `Cpu=cpuN` dimension. This measures each CPU's non-idle/non-iowait fraction
+from Linux `/proc/stat`; guest counters are excluded from the total because user
+and nice already include them. No aggregate CPU row or core average is emitted.
+CPU-core inspection and publisher-thread scaling are distinct measurements.
 
-For example, readings of `[75, 65]` over both periods require one extra publisher.
-After the new publisher becomes eligible and reports `[10, 10]`, `[75, 65, 10]`
-already has enough headroom: sticky load on the first publisher does not keep
-launching instances. `[85, 65, 10]` requires a second ready spare. These are
-examples of policy behavior, not measured NPA routing behavior.
+At 70% thread CPU in each of two closed minutes, require one healthy InService
+publisher below or equal to 40% in both periods. At 80% in the latest closed
+minute, require two. Existing cool publishers count as headroom. Adding enough
+headroom then holds capacity even if sticky existing sessions stay hot.
 
-Only this controller may write desired capacity while enabled. Disable/remove
-legacy scaling policies and scheduled capacity actions during an intentional
-maintenance migration. The controller rejects them even in observation mode.
-Pause this controller before an operator or other automation changes capacity.
-A fresh ASG read checks desired/min/max just before the write, but AWS provides
-no conditional compare-and-set for `SetDesiredCapacity`; an uncoordinated writer
-can still race the request. Never run two controller stacks against the same ASG.
+The controller uses normal current ASG `Healthy`/`InService` state and complete
+collector health/CPU samples. The ordinary launch workflow must register new
+publishers before putting them InService. An already registered healthy publisher
+requires no new tenant-specific eligibility verifier or readiness marker.
+Publisher process/thread measurement failures produce unhealthy telemetry, not
+fabricated zero CPU. ASG health otherwise follows the group's existing checks.
 
-Scale-in remains a separate drained maintenance operation. This add-on cannot
-prevent termination caused by operators, EC2 failure replacement, Spot events,
-or other AWS mechanisms. Low CPU does not prove that sticky sessions can be
-terminated safely.
+## Official Marketplace AMI
 
-## Identify the publisher on the EC2 host
+Use the [Netskope Private Access Publisher listing](https://aws.amazon.com/marketplace/pp/prodview-sv7z6ot7sefiy), sold by Netskope, as the image source.
+The listing describes Ubuntu 22.04 x86_64. Regional EC2 metadata verified on
+2026-10-12 identifies Marketplace version 140.1.0.11337:
 
-Run the collector on the **host**, with root procfs access. Do not install it
-inside the publisher container or use aggregate `docker stats` as the scaling
-metric. The collector reads thread CPU counters, so scheduler migration between
-cores does not change its units.
+| Region | AMI |
+|---|---|
+| Frankfurt (`eu-central-1`) | `ami-059e32c80fcfbab6e` |
+| Northern Virginia (`us-east-1`) | `ami-085f0a08151861720` |
 
-Use `docker ps`, `docker top CONTAINER -eo pid,ppid,comm,nlwp`, and
-`sudo readlink /proc/HOST_PID/exe` to identify the forwarding publisher executable.
-Do not select the watchdog, diagnostic server, or the entire container.
+Both share Marketplace product code `25q3w26r1r9gcd4w1k0x888g2`. AMI IDs are
+regional; do not use the Virginia identifier in Frankfurt. The public listing's
+cached release information can lag the actual regional image metadata.
 
-A read-only check on the user's Frankfurt publisher on 2026-10-12 found the
-executable `/home/npa_publisher` and two OS threads. The Docker container was
-running with no explicit CPU quota or cpuset restriction. Both measured threads
-were idle; loaded behavior was not qualified. Container names and PIDs from that
-check are transient and must not be copied into a reusable AMI.
-
-Use a stable container name in launch automation. The collector resolves that
-name to the current full Docker ID on every sample, then checks the process's
-host cgroup membership. If the name or executable matches no publisher, or more
-than one publisher, report unhealthy telemetry rather than guessing.
-
-A read-only inspection requires no boto3 installation or AWS access:
+To select the verified Frankfurt image explicitly in launch-template input:
 
 ```bash
-sudo python3 scripts/publisher_metrics.py --executable /home/npa_publisher --container-name publisher --inspect --samples 3 --interval 2
+python3 scripts/generate-cloud-init.py --group YOUR-PUBLISHER-ASG --ami-id ami-059e32c80fcfbab6e
 ```
 
-The first sample is a baseline with no CPU reading. Subsequent readings report
-`cpu_percent_one_vcpu` and the hottest host thread ID. A CPU reading is user plus
-system CPU time divided by monotonic elapsed time, with no CPU-count divisor.
-A new/reused thread or process requires a new baseline. Do not treat missing
-readings as zero.
+Without `--ami-id`, generated input contains only UserData and inherits the image
+from the selected source launch-template version. Marketplace access/subscription
+must be available in the deployment account; the generator does not subscribe,
+accept terms, or launch an instance. Reverify regional image availability before
+provisioning. This verification established image metadata, not a fresh boot of
+the image with the collector installed.
 
-## Give the host permission to publish telemetry
+## Provision through cloud-init
 
-The host needs an instance profile with `cloudwatch:PutMetricData` constrained
-to namespace `NPA/Publisher`. Attach this policy to the existing publisher EC2
-role through the infrastructure that owns that role:
+Run the collector on the EC2 host with procfs access. Keep the publisher binary
+and Docker image unchanged. The publisher executable found by read-only inspection
+on Frankfurt is `/home/npa_publisher`.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "cloudwatch:PutMetricData",
-    "Resource": "*",
-    "Condition": {"StringEquals": {"cloudwatch:namespace": "NPA/Publisher"}}
-  }]
-}
-```
-
-Allow outbound HTTPS to CloudWatch and the package sources used during bootstrap,
-or provide regional/private endpoints and a prebuilt collector environment.
-Keep credentials in the EC2 instance role, not JSON configuration or the AMI.
-
-The collector resolves `instance_id` and `region` through IMDSv2 when configured
-as `auto`. It does not fall back to IMDSv1. Run it on the host so container hop
-limits do not affect metadata requests. Explicit identity values are supported
-for environments without IMDS; each instance must receive its own instance ID.
-
-## Install the host collector
-
-Create `collector-config.json` with deployment-specific values:
-
-```json
-{
-  "executable": "/home/npa_publisher",
-  "container_name": "publisher",
-  "group": "YOUR-PUBLISHER-ASG",
-  "instance_id": "auto",
-  "region": "auto",
-  "ready_file": "/run/npa-metrics/ready.json",
-  "ready_ttl": 180,
-  "interval": 10
-}
-```
-
-For a publisher running directly on the host, omit `container_name`. An optional
-`pid_file` selects one host PID and still verifies its exact executable.
-
-Install with Python 3.10+ and the platform's venv package available:
+Generate the provisioning payload locally:
 
 ```bash
-sudo bash scripts/install-thread-metrics.sh collector-config.json
+python3 scripts/generate-cloud-init.py --group YOUR-PUBLISHER-ASG
 ```
 
-The installer copies the collector/config, installs boto3 into an isolated venv,
-and enables `npa-thread-metrics.service`. Integrate this installation into the
-AMI build or existing launch bootstrap so **every future instance** emits metrics.
-Ensure that exactly one collector publishes each instance's metric series; sample
-counts are not a substitute for preventing duplicate collectors.
+Use `--container-name publisher` if launch automation assigns a stable container
+name, and `--executable /absolute/publisher/path` for another image. Without a
+container selector, exactly one matching executable must exist on the host.
+The collector can find the publisher inside Docker from host procfs.
 
-## Integrate actual registration readiness
+Output files:
 
-Readiness must confirm that this process is registered with Netskope, assigned
-to the intended applications, and eligible for new connections. Neither process
-existence, low CPU, EC2 health, nor ASG `InService` alone establishes that fact.
+- `dist/publisher-user-data.gz`: compressed cloud-config, under EC2's 16 KiB raw
+  user-data limit; cloud-init automatically decompresses it.
+- `dist/publisher-user-data.yaml`: readable cloud-config for review/schema checking.
+- `dist/publisher-user-data.launch-template.json`: already base64-encoded UserData
+  for the EC2 launch-template API.
 
-After the existing lifecycle/verifier confirms eligibility, run on the host:
+The payload embeds the reviewed collector source, its configuration, and the
+systemd unit. Cloud-init installs Python 3/venv and boto3, then enables and starts
+the collector. It reads instance identity through IMDSv2 and publishes using the
+existing EC2 instance role. No credentials or tenant API tokens are embedded.
+Use an Ubuntu/Debian publisher host with Python 3.10+, cloud-init, package-network
+access or a prebuilt dependency environment, and outbound HTTPS to CloudWatch.
+
+Inspect existing launch-template user data before changing it. If it is an
+existing cloud-config mapping, preserve it by passing the reviewed local file:
 
 ```bash
-sudo /opt/npa-thread-metrics/venv/bin/python /opt/npa-thread-metrics/publisher_metrics.py --config /etc/npa-thread-metrics.json --mark-ready
+python3 scripts/generate-cloud-init.py --group YOUR-PUBLISHER-ASG --base-cloud-config existing-user-data.yaml
 ```
 
-Have the eligibility verifier renew this acknowledgement every 60 seconds **only
-while eligibility is still confirmed**, and clear `/run/npa-metrics/ready.json`
-when eligibility is lost. Do not use an unconditional cron renewal. The marker
-records the selected PID, procfs start time, and verification time; it expires
-after 180 seconds and becomes invalid immediately when the publisher restarts.
-The marker is an integration interface, not an included Netskope API verifier.
-Implement and test the verifier against the tenant's actual supported API/health
-contract before enabling scaling. The upstream checked-in Lambda is unsuitable
-for this purpose.
+The generator preserves existing packages, write_files, bootcmd, registration
+runcmd, and other cloud-config keys. It appends collector setup after existing
+runcmd and rejects conflicting collector paths or malformed list fields. Existing
+runcmd must complete; do not leave a foreground publisher command blocking it.
+Script, MIME, and cloud-boothook inputs require integration in their owning
+bootstrap rather than treating them as cloud-config or overwriting them.
 
-The collector emits `HottestThreadCPU` (Percent), `PublisherReady` (Count), and
-`CollectorHealthy` (Count) into `NPA/Publisher`, with exactly these dimensions:
-`AutoScalingGroupName` and `InstanceId`. Publish every 10 seconds. CPU timestamps
-reflect collection time, not eventual SDK completion. Sampling skips missed
-intervals instead of generating a burst of catch-up samples.
+Resolve the version currently used by the ASG; do not assume an unreferenced
+`$Latest` version has the right bootstrap. After reviewing the generated input,
+create a launch-template version inheriting
+the existing image, instance profile, networking, and other launch configuration:
 
-The controller reads both newest closed one-minute buckets and requires six
-health samples per bucket, health/readiness minima of 1, and valid CPU maxima.
-A whole or partial telemetry gap, unknown thread baseline, expired readiness,
-or delivery delay prevents the instance being treated as usable headroom.
-The conservative current implementation inhibits capacity writes until **all**
-current healthy InService members have complete ready telemetry; it emits
-`MissingTelemetry` so this condition is actionable. A pending/unhealthy member
-instead yields `capacity_transition`; inspect ASG lifecycle events and controller
-logs for stuck registration. The CapacityTransition alarm fires after 15
-consecutive minutes; missing controller heartbeats alarm after three minutes.
-Maintain baseline spare capacity while qualifying
-telemetry delivery and readiness latency.
+```bash
+aws ec2 create-launch-template-version --launch-template-id YOUR-LAUNCH-TEMPLATE-ID --source-version ACTIVE-ASG-LAUNCH-VERSION --launch-template-data file://dist/publisher-user-data.launch-template.json
+```
+
+Then select that returned version for future ASG launches:
+
+```bash
+aws autoscaling update-auto-scaling-group --auto-scaling-group-name YOUR-PUBLISHER-ASG --launch-template LaunchTemplateId=YOUR-LAUNCH-TEMPLATE-ID,Version=NEW-VERSION
+```
+
+Use the IaC resource that owns the launch template/group when available, so its
+configuration remains authoritative. If the ASG uses a launch configuration or
+mixed-instances launch structure, integrate the same UserData through that
+owner; the simple command above applies to a direct launch-template ASG.
+Updating user data does not install the collector on running instances. Existing
+instances must be brought onto the provisioning version through planned drained
+replacement. Keep the controller in observation mode until current members
+publish complete data. This work generates artifacts only; it does not run the
+AWS mutation commands or replace/restart the active publisher.
+
+## Host metric permissions
+
+Supply `PublisherInstanceRoleName` to the controller stack: the existing IAM role
+in the publisher EC2 instance profile, not the instance profile's name or ARN.
+The template attaches permission for only `cloudwatch:PutMetricData` in namespace
+`NPA/Publisher`. Host credentials remain in the EC2 role. Controller permissions
+are separate and limited to observations, its state, and the chosen ASG capacity.
+
+The collector sends `HottestThreadCPU` and `CollectorHealthy` with dimensions
+`AutoScalingGroupName` and `InstanceId` every 10 seconds. Individual CPU metrics
+add `Cpu`. Use exactly one collector per publisher. Preserve collection timestamps
+across SDK delays; missed intervals are skipped, never filled with catch-up bursts.
+A new/reused thread requires a baseline before a full hottest-thread reading.
+
+The controller requires six health samples in each of both newest closed minutes,
+health minima of 1, and valid CPU maxima. Missing, partial, or delayed data inhibits
+capacity requests and emits `MissingTelemetry`. Initial boot and process restart
+therefore need complete metric windows before counting as usable headroom.
 
 ## Package and deploy in observation mode
 
-Build the reviewed controller source into a deterministic ZIP and record its
-printed SHA-256:
+Build and record the SHA-256 of the reviewed Lambda source:
 
 ```bash
 python3 scripts/package-controller.py dist/controller.zip
 ```
 
-Upload to a regional bucket owned by the operator. Use a content-addressed key
-and do not overwrite it; optionally supply an S3 object version as well:
+Upload to an operator-owned regional bucket under an immutable key:
 
 ```bash
 aws s3 cp dist/controller.zip s3://YOUR-BUCKET/npa-thread-scaling/CONTROLLER-SHA256.zip
@@ -186,6 +164,7 @@ Create `controller-parameters.json`:
 ```json
 [
   {"ParameterKey":"AutoScalingGroupName","ParameterValue":"YOUR-PUBLISHER-ASG"},
+  {"ParameterKey":"PublisherInstanceRoleName","ParameterValue":"YOUR-PUBLISHER-EC2-ROLE"},
   {"ParameterKey":"ControllerCodeBucket","ParameterValue":"YOUR-BUCKET"},
   {"ParameterKey":"ControllerCodeKey","ParameterValue":"npa-thread-scaling/CONTROLLER-SHA256.zip"},
   {"ParameterKey":"EnableScaling","ParameterValue":"false"},
@@ -196,49 +175,52 @@ Create `controller-parameters.json`:
 ]
 ```
 
-Require `0 <= spare < early <= urgent <= 100`. The controller rejects inconsistent
-thresholds. Supply `AlarmTopicArn` to connect an existing SNS alert topic.
+Supply `AlarmTopicArn` to use an existing SNS alert topic. Optionally pin the S3
+artifact version with `ControllerCodeVersion`.
 
 ```bash
 aws cloudformation create-stack --stack-name publisher-thread-scaling --template-body file://templates/publisher-thread-scaling.yaml --parameters file://controller-parameters.json --capabilities CAPABILITY_IAM
 ```
 
-Observation mode reads AWS state and writes diagnostic metrics/logs only. It does
-not reserve cooldown or change ASG desired capacity. The stack creates only the
-controller, retained state, scheduler, log group, role, and alarms.
+The controller observes and emits diagnostics by default. It does not reserve
+cooldown or change desired capacity until `EnableScaling=true`. The stack attaches
+host metric permission but does not install software on existing instances.
 
-No real stack deployment, metric publication, role attachment, readiness renewal,
-or tenant changes were performed during development of this fork.
+Use an instance-count ASG, one publisher per instance, with a working ordinary
+launch/registration flow. The controller must be the sole desired-capacity writer;
+it rejects other scaling policies and scheduled actions. Pause it for manual
+capacity changes. A recheck before writing reduces races, but AWS provides no
+conditional capacity update. Do not attach two controllers to the same ASG.
 
-## Qualify before enabling capacity writes
+## Qualification and operation
 
-Compare thread CPU readings with actual loaded publisher behavior. Verify all
-current and newly launched instances provide complete metric windows and fresh
-readiness. Confirm that adding publishers causes **new** connections to use them
-while existing sessions stay connected. If a cool eligible publisher receives
-no new traffic, investigate routing/eligibility rather than raising ASG capacity.
+Validate cloud-init on a fresh publisher launch, including role permission,
+collector startup, exact process selection, registration, complete metrics, and
+new-client distribution. Measure detection plus launch-to-ready time. The early
+rule uses two closed minutes and the urgent rule one; lower thresholds or keep
+more baseline capacity if saturation can occur sooner than provisioning.
 
-Measure from a threshold crossing through two-period detection, CloudWatch
-delivery, the next controller tick, EC2 launch, registration, and the first new
-connection on the added publisher. The 70% early rule may take roughly two to
-three minutes to detect sustained load, before provisioning time; the urgent
-rule still uses a closed minute. If CPU can saturate sooner, lower thresholds,
-maintain more baseline publishers, or redesign for shorter metric windows.
+Test restart, missing/sparse telemetry, stuck launches, ASG maximum, cooldown,
+and SDK failures. Missing heartbeats alert after three minutes; a capacity
+transition stuck for 15 minutes alerts separately. At capacity limits, investigate
+traffic and capacity rather than assuming an idle second core supplies headroom.
 
-Test missing/stale telemetry, registration failure, process/container restart,
-retained hot sticky load, ASG maximum, SDK failures, and cooldown contention in
-a nonproduction group. Verify alarm delivery and the absence of scale-in.
-Pending capacity cannot prove it will become ready; stuck launches need operator
-attention, not unlimited replacement launches.
+When evidence supports the chosen thresholds, update with `EnableScaling=true`.
+Return to false to pause capacity writes. Existing sticky connections remain on
+their publisher; new capacity cannot move them or prevent their traffic increasing.
+Use explicit drained maintenance for scale-in. Removing the controller retains
+its state table, which needs deliberate cleanup when retired.
 
-After qualification, update this stack with `EnableScaling=true`. Pause capacity
-writes by changing it back to `false`; that preserves the observed publishers
-and desired capacity. Preserve DynamoDB cooldown state when replacing the stack.
-On stack deletion its state table is retained and needs deliberate cleanup.
+A read-only Frankfurt check sampled the selected Docker publisher while idle.
+The generated cloud-config also passed that host's cloud-init 26.1 schema validator
+using an anonymous memory file, without running provisioning commands. No software
+installation, instance monitoring change, publisher restart, or AWS/tenant
+configuration change was performed. Fresh-boot and loaded behavior remain
+qualification steps rather than claims established by the idle/schema checks.
 
-AWS references:
+References:
 
-- [CloudWatch metric retrieval](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_GetMetricData.html)
-- [Desired capacity behavior](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_SetDesiredCapacity.html)
-- [IMDSv2 identity access](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
+- [EC2 user data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)
+- [Cloud-init user-data formats](https://docs.cloud-init.io/en/latest/explanation/format/index.html)
 - [Linux thread CPU fields](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)
+- [AWS capacity write behavior](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_SetDesiredCapacity.html)

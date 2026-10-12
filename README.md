@@ -1,49 +1,60 @@
-# Preventive autoscaling for NPA publisher threads
+# Preventive NPA publisher thread autoscaling
 
-This fork adds capacity before the busiest Netskope Private Access publisher
-thread saturates one vCPU. Existing sticky connections stay on their publisher;
-new connections can use ready publishers with headroom.
+Add capacity before the busiest publisher thread saturates one vCPU. Measure
+actual publisher thread CPU directly; never use instance-wide CPU averages,
+fleet averages, or a multiplier to infer a busy core.
 
-The controller uses the highest individual publisher thread CPU. A second idle
-core or a low fleet average cannot hide a hot publisher.
+Cloud-init provisions the host collector automatically on new publishers. The
+publisher binary and Docker image need no changes. Existing registration and ASG
+health remain in use, with no separate tenant eligibility checker or readiness
+marker protocol.
 
 | Default condition | Required headroom |
 |---|---|
-| One publisher at or above 70% in two closed minutes | One ready publisher at or below 40% |
-| Any publisher at or above 80% in the latest closed minute | Two ready publishers at or below 40% |
-| Enough ready headroom already exists | Hold capacity, even while sticky load stays hot |
-| Capacity is launching, telemetry is incomplete, or cooldown is active | Hold and report the reason |
+| One publisher reaches 70% in each of two closed minutes | One healthy InService publisher at or below 40% |
+| Any publisher reaches 80% in the latest closed minute | Two healthy InService publishers at or below 40% |
+| Enough cool publishers already exist | Hold capacity despite persistent sticky load |
+| Capacity is launching, metrics are incomplete, or cooldown is active | Hold and report the reason |
 | Required headroom exceeds the ASG maximum | Add only permitted capacity and alert |
 
-The CPU percentages represent **one vCPU**, independent of the instance's core
-count. These thresholds are starting values, not a throughput guarantee. Tune
-against measured CPU growth and launch-to-ready time. Spare capacity helps only
-if the NPA routing layer sends new connections to eligible cool publishers.
+All thresholds represent actual CPU time of the busiest publisher thread relative
+to **one vCPU**. An idle second vCPU never dilutes this signal. Thread migration
+between CPUs does not dilute it either. The collector also publishes each logical
+CPU separately as `CPUCoreUtilization`, with `Cpu=cpu0`, `Cpu=cpu1`, etc.; those
+individual CPU measurements are inspection metrics, not averages.
 
-## Components
+Existing sticky clients remain connected; new clients can use added publishers.
+Maintain headroom rather than repeatedly launching idle instances while existing
+sticky sessions stay hot. Tune thresholds against measured CPU growth and
+launch-to-ready time, and confirm that new clients spread to added publishers.
 
-- **Linux host collector:** Reads each publisher thread's user/system CPU time
-  under `/proc`. Select one exact executable, optionally within a named Docker
-  container. Publish CPU, collector health, and explicit registration readiness
-  every 10 seconds. No publisher binary changes are required.
-- **Scheduled controller:** Checks current ASG members and closed CloudWatch
-  periods every minute. Add only the missing ready headroom. Require six samples
-  in each minute, serialize requests, honor a durable cooldown, and respect the
-  ASG maximum. Never infer readiness from an idle CPU reading.
-- **CloudFormation add-on:** Deploy the controller, state, and alarms against an
-  **existing verified publisher ASG**. Default to observation-only. The add-on
-  does not create publishers or replace their registration workflow.
+## Provision and deploy
 
-Automatic scale-in is deliberately absent. Remove publishers only through a
-verified draining procedure. The controller must be the group's sole capacity
-writer when enabled; it rejects existing scaling policies and scheduled actions.
+Read [deployment and cloud-init integration](docs/PUBLISHER_THREAD_SCALING.md).
+Use the official Netskope Marketplace AMI; version 140.1.0.11337 was verified as
+`ami-059e32c80fcfbab6e` in Frankfurt and `ami-085f0a08151861720` in Virginia.
+The supported controller template is `templates/publisher-thread-scaling.yaml`.
+It grants the existing publisher instance role permission to publish the metrics.
 
-## Start here
+Generate cloud-init user data from the reviewed collector source:
 
-Read [deployment and qualification](docs/PUBLISHER_THREAD_SCALING.md) for host
-installation, readiness integration, permissions, packaging, observation, and
-enabling scaling. Read [the design](docs/PUBLISHER_THREAD_SCALING_DESIGN.md) for
-constraints and implementation scope.
+```bash
+python3 scripts/generate-cloud-init.py --group YOUR-PUBLISHER-ASG
+```
+
+The generator creates compressed EC2 user data and launch-template JSON under
+`dist/`. It embeds the collector, JSON configuration, and systemd unit; cloud-init
+installs dependencies and starts collection at boot. Supply `--base-cloud-config`
+to preserve an existing cloud-config registration/bootstrap. Never replace
+unexamined script or MIME user data with this payload.
+
+The controller attaches to an existing ASG with a working launch/registration
+workflow. It defaults to observation-only, uses durable cooldown and launch
+controls, and performs scale-out only. It rejects competing policies/schedules
+and requires exclusive ownership of desired-capacity writes. Remove publishers
+through explicit drained maintenance.
+
+## Development and validation
 
 ```bash
 python3 -m venv .venv
@@ -53,42 +64,30 @@ python3 -m venv .venv
 python3 scripts/package-controller.py dist/controller.zip
 ```
 
-Deployment uses `templates/publisher-thread-scaling.yaml`. Upload the locally
-built ZIP to an operator-owned regional S3 bucket and pass its immutable key to
-the stack. No dependency on an upstream-owned Lambda deployment bucket exists.
+Tests cover exact single-vCPU units, per-CPU separation, busiest-thread selection,
+thread/process restart and migration, Docker selection, missing/sparse telemetry,
+sticky headroom, cooldown, AWS failures, and capacity limits. Cloud-init tests
+verify source embedding, preserved bootstrap, and the EC2 user-data size limit.
+CI also exercises real Linux procfs and checks packaging, formatting, lint,
+security, secrets, and the template.
 
-## Validation status
-
-Unit and AWS SDK adapter tests cover threshold persistence, sticky-load headroom,
-thread/process restarts, Docker selection, missing and sparse telemetry, readiness
-expiry, cooldown contention, concurrent capacity changes, and observation safety.
-CI also tests real Linux `/proc` CPU sampling, packages the reviewed source, and
-checks the supported template and Python code.
-
-A read-only Frankfurt check identified `/home/npa_publisher` inside Docker with
-two OS threads and confirmed the collector can sample both. That publisher was
-idle during the check. This establishes compatibility with that process layout;
-it does not establish loaded throughput, ASG registration, routing, or production
-readiness. No AWS stack or tenant configuration was changed.
+Read-only Frankfurt inspection identified `/home/npa_publisher` in Docker, and
+sampling worked while it was idle. The generated user data passed the installed
+cloud-init schema validator using an anonymous memory file, without executing
+provisioning commands. No collector installation, publisher restart, monitoring
+change, AWS deployment, or tenant change was performed on that host. Fresh-instance
+provisioning, loaded behavior, and traffic distribution still need qualification
+before capacity writes are enabled. See [the design](docs/PUBLISHER_THREAD_SCALING_DESIGN.md).
 
 ## Upstream implementation
 
-The original upstream implementation remains at
-`templates/npa-publisher-autoscaling.yaml`; its original documentation is in
-`docs/DEPLOYMENT_GUIDE.md`, `docs/DEVOPS_NOTES.md`, and
-`docs/NPA_AWS_HA_STRATEGIES.md`. Treat these as historical reference.
-
-The original template uses `ASGAverageCPUUtilization` at 70% on a two-vCPU
-`t3.large`. A single saturated thread contributes roughly 50% EC2 instance CPU,
-so the default can miss saturation. Its checked-in lifecycle Lambda and ZIP
-handle CloudWatch log forwarding, not the documented publisher registration
-flow; the original template instead references a separately hosted S3 ZIP whose
-contents are not verified here. Current cfn-lint also reports E3712 for its
-initial zero-capacity ASG. This fork's supported add-on avoids those dependencies
-and requires an independently verified publisher lifecycle integration.
-
-See [AWS target tracking metric semantics](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
-and [EC2 CPU accounting](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/burstable-credits-baseline-concepts.html).
+The original `templates/npa-publisher-autoscaling.yaml` and its documentation
+remain historical reference. Its 70% `ASGAverageCPUUtilization` target on two-vCPU
+instances can miss single-thread saturation. The checked-in lifecycle Lambda/ZIP
+forwards CloudWatch logs rather than implementing the advertised registration
+workflow. The original template references a separately hosted deployment ZIP
+whose contents are unverified here and has a baseline cfn-lint E3712 bootstrap
+issue. This controller requires an existing working registration workflow.
 
 ## License
 

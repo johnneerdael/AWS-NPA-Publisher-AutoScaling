@@ -34,7 +34,6 @@ def telemetry(cpus):
         instance: {
             "cpu": values,
             "healthy": [1, 1],
-            "ready": [1, 1],
             "count": [6, 6],
         }
         for instance, values in cpus.items()
@@ -64,7 +63,7 @@ class DecisionTests(unittest.TestCase):
             "below_threshold",
         )
 
-    def test_sticky_hot_publisher_stops_launching_when_spares_ready(self):
+    def test_sticky_hot_publisher_stops_launching_when_spares_available(self):
         steps = [
             ({"hot": [75, 75]}, 2),
             ({"hot": [75, 75], "spare": [10, 10]}, None),
@@ -81,7 +80,7 @@ class DecisionTests(unittest.TestCase):
             3,
         )
 
-    def test_invalid_missing_or_unready_telemetry_inhibits(self):
+    def test_invalid_or_missing_telemetry_inhibits(self):
         cpus = {"hot": [90, 90], "other": [5, 5]}
         for field, values in [
             ("cpu", [None, 5]),
@@ -89,7 +88,6 @@ class DecisionTests(unittest.TestCase):
             ("cpu", [5, float("inf")]),
             ("cpu", [-1, 5]),
             ("cpu", [5]),
-            ("ready", [1, 0]),
             ("healthy", [0, 1]),
             ("healthy", [2, 1]),
         ]:
@@ -149,16 +147,14 @@ class DecisionTests(unittest.TestCase):
         self.assertIsNone(result.hottest_cpu)
         self.assertEqual(result.reason, "missing_telemetry")
 
-    def test_hot_unready_or_unhealthy_sample_remains_visible(self):
+    def test_hot_unhealthy_sample_remains_visible(self):
         cpus = {"hot": [90, 95]}
-        for field in ("ready", "healthy"):
-            samples = telemetry(cpus)
-            samples["hot"][field] = [1, 0]
-            with self.subTest(field=field):
-                result = controller.decide(group(cpus), samples, self.config)
-                self.assertEqual(result.hottest_cpu, 95)
-                self.assertEqual(result.reason, "missing_telemetry")
-                self.assertIsNone(result.desired_capacity)
+        samples = telemetry(cpus)
+        samples["hot"]["healthy"] = [1, 0]
+        result = controller.decide(group(cpus), samples, self.config)
+        self.assertEqual(result.hottest_cpu, 95)
+        self.assertEqual(result.reason, "missing_telemetry")
+        self.assertIsNone(result.desired_capacity)
 
     def test_sparse_spare_sample_does_not_prove_full_minute_headroom(self):
         cpus = {"hot": [90, 95], "spare": [0, 0]}
@@ -251,7 +247,6 @@ class AdapterTests(unittest.TestCase):
             for suffix, name, statistic, unit in [
                 ("c", "HottestThreadCPU", "Maximum", "Percent"),
                 ("h", "CollectorHealthy", "Minimum", "Count"),
-                ("r", "PublisherReady", "Minimum", "Count"),
                 ("n", "CollectorHealthy", "SampleCount", "Count"),
             ]:
                 queries.append(
@@ -304,7 +299,6 @@ class AdapterTests(unittest.TestCase):
             for suffix, samples in [
                 ("c", values),
                 ("h", [1, 1]),
-                ("r", [1, 1]),
                 ("n", [6, 6]),
             ]:
                 results.append(
@@ -387,8 +381,20 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["reason"], "capacity_transition")
         self.assert_consumed()
 
-    def test_reserve_then_scale_with_closed_minute_queries(self):
+    def test_healthy_registered_asg_member_scales_with_thread_and_health_only(self):
         self.seed({"i-hot": [75, 75]})
+        queries = self.query_request({"i-hot": [75, 75]})["MetricDataQueries"]
+        self.assertEqual(len(queries), 3)
+        self.assertEqual(
+            {query["MetricStat"]["Metric"]["MetricName"] for query in queries},
+            {"HottestThreadCPU", "CollectorHealthy"},
+        )
+        self.assertTrue(
+            all(
+                query["MetricStat"]["Metric"]["Namespace"] == "NPA/Publisher"
+                for query in queries
+            )
+        )
         self.stubs["dynamodb"].add_response("update_item", {}, self.reserve_request(2))
         self.seed_recheck({"i-hot": [75, 75]})
         self.stubs["autoscaling"].add_response(
@@ -473,10 +479,10 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.run_controller()["reason"], "capacity_changed")
         self.assert_consumed()
 
-    def test_invalid_readiness_does_not_hide_measured_cpu(self):
+    def test_invalid_collector_health_does_not_hide_measured_cpu(self):
         self.seed(
             {"i-hot": [90, 95]},
-            lambda results: results[2].update(Values=[1, 0]),
+            lambda results: results[1].update(Values=[1, 0]),
         )
         self.diagnostics(95, missing=1)
         result = self.run_controller()
@@ -487,7 +493,7 @@ class AdapterTests(unittest.TestCase):
     def test_sparse_healthy_sample_inhibits_sdk_capacity_write(self):
         self.seed(
             {"i-hot": [90, 95]},
-            lambda results: results[3].update(Values=[6, 1]),
+            lambda results: results[2].update(Values=[6, 1]),
         )
         self.diagnostics(95, missing=1)
         self.assertEqual(self.run_controller()["reason"], "missing_telemetry")
@@ -561,7 +567,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_metric_pagination_preserves_both_required_periods(self):
         request = self.query_request({"i-hot": [75, 75]})
-        ids = ["m0c", "m0h", "m0r", "m0n"]
+        ids = ["m0c", "m0h", "m0n"]
         first = [
             {
                 "Id": metric_id,
@@ -611,7 +617,6 @@ class AdapterTests(unittest.TestCase):
                 "i-hot": {
                     "cpu": [75, 80],
                     "healthy": [1, 1],
-                    "ready": [1, 1],
                     "count": [6, 6],
                 }
             },

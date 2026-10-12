@@ -51,7 +51,6 @@ class MetricsTest(unittest.TestCase):
                 {
                     "executable": self.exe,
                     "group": "group",
-                    "ready_file": "/run/npa-metrics/ready.json",
                     "container_name": "publisher",
                 }
             )
@@ -63,13 +62,14 @@ class MetricsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             metrics.read_configuration(config)
 
-    def test_ready_proof_expires_instead_of_remaining_ready_forever(self):
-        marker = self.root / "ready.json"
-        identity = self.selector().select()
-        metrics.mark_ready(marker, identity, now=1000)
-        self.assertTrue(metrics.is_ready(marker, identity, now=1100))
-        self.assertFalse(metrics.is_ready(marker, identity, now=1200))
-        self.assertFalse(metrics.is_ready(marker, identity, now=900))
+    def test_configuration_rejects_removed_readiness_fields(self):
+        import json
+
+        config = self.root / "config.json"
+        for field, value in [("ready_file", "ready.json"), ("ready_ttl", 180)]:
+            config.write_text(json.dumps({"executable": self.exe, field: value}))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                metrics.read_configuration(config)
 
     def test_stat_parser_handles_parentheses_in_thread_name(self):
         self.assertEqual(metrics.parse_stat(stat_text(123, 70)), (70, 100))
@@ -164,25 +164,12 @@ class MetricsTest(unittest.TestCase):
         with self.assertRaises(metrics.CollectionError):
             sampler.sample(now=10)
 
-    def test_readiness_marker_is_bound_to_process_start(self):
-        marker = self.root / "ready.json"
-        identity = self.selector().select()
-        self.assertFalse(metrics.is_ready(marker, identity))
-        metrics.mark_ready(marker, identity)
-        self.assertTrue(metrics.is_ready(marker, identity))
-        (self.root / "123/stat").write_text(stat_text(123, 0, 200))
-        self.assertFalse(metrics.is_ready(marker, self.selector().select()))
-        marker.write_text("broken")
-        self.assertFalse(metrics.is_ready(marker, identity))
-
     def test_metric_dimensions_and_health_failure_does_not_emit_cpu(self):
         identity = self.selector().select()
         result = metrics.ThreadSample(identity, 70, 123)
-        payload = metrics.metric_data("group", "i-example", result, ready=True)
+        payload = metrics.metric_data("group", "i-example", result)
         values = {item["MetricName"]: item["Value"] for item in payload}
-        self.assertEqual(
-            values, {"HottestThreadCPU": 70, "PublisherReady": 1, "CollectorHealthy": 1}
-        )
+        self.assertEqual(values, {"HottestThreadCPU": 70, "CollectorHealthy": 1})
         for item in payload:
             self.assertEqual(
                 item["Dimensions"],
@@ -191,11 +178,162 @@ class MetricsTest(unittest.TestCase):
                     {"Name": "InstanceId", "Value": "i-example"},
                 ],
             )
-        failed = metrics.metric_data("group", "i-example", None, ready=False)
+        failed = metrics.metric_data("group", "i-example", None)
         self.assertEqual(
             {i["MetricName"]: i["Value"] for i in failed},
-            {"PublisherReady": 0, "CollectorHealthy": 0},
+            {"CollectorHealthy": 0},
         )
+
+    def core_stat(self, rows):
+        # The aggregate row must never affect any per-core reading.
+        lines = ["cpu deliberately invalid aggregate row", "intr 123"]
+        lines += [
+            cpu + " " + " ".join(map(str, values)) for cpu, values in rows.items()
+        ]
+        (self.root / "stat").write_text("\n".join(lines) + "\n")
+
+    def test_hot_core_is_not_averaged_with_idle_core_or_guest_time(self):
+        self.core_stat({"cpu0": [0] * 10, "cpu1": [0] * 10})
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        self.assertEqual(sampler.sample(now=10).core_cpu, {})
+        self.core_stat(
+            {
+                "cpu0": [80, 0, 0, 20, 0, 0, 0, 0, 80, 0],
+                "cpu1": [0, 0, 0, 100, 0, 0, 0, 0, 0, 0],
+            }
+        )
+        self.thread(123, 123, 80, processor=1)
+        sample = sampler.sample(now=11)
+        self.assertEqual(sample.cpu, 80)
+        self.assertEqual(sample.core_cpu, {"cpu0": 80, "cpu1": 0})
+
+    def test_core_iowait_is_idle_and_other_first_eight_counters_are_busy(self):
+        self.core_stat({"cpu0": [0] * 10})
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        sampler.sample(now=10)
+        self.core_stat({"cpu0": [60, 5, 5, 10, 10, 5, 0, 5, 60, 5]})
+        self.assertEqual(sampler.sample(now=11).core_cpu, {"cpu0": 80})
+
+    def test_missing_or_malformed_core_file_keeps_thread_cpu_usable(self):
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        sampler.sample(now=10)
+        for now, ticks, text in [(11, 75, None), (12, 150, "cpu0 broken")]:
+            if text is not None:
+                (self.root / "stat").write_text(text)
+            self.thread(123, 123, ticks)
+            sample = sampler.sample(now=now)
+            with self.subTest(core_file=text):
+                self.assertEqual(sample.cpu, 75)
+                self.assertEqual(sample.core_cpu, {})
+                self.assertEqual(metrics.metric_data("g", "i", sample)[0]["Value"], 1)
+
+    def test_core_read_failure_discards_the_previous_baseline(self):
+        self.core_stat({"cpu0": [0] * 8})
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        sampler.sample(now=10)
+        self.core_stat({"cpu0": [80, 0, 0, 20, 0, 0, 0, 0]})
+        self.assertEqual(sampler.sample(now=11).core_cpu, {"cpu0": 80})
+        (self.root / "stat").unlink()
+        self.assertEqual(sampler.sample(now=12).core_cpu, {})
+        self.core_stat({"cpu0": [900, 0, 0, 100, 0, 0, 0, 0]})
+        self.assertEqual(sampler.sample(now=13).core_cpu, {})
+        self.core_stat({"cpu0": [980, 0, 0, 120, 0, 0, 0, 0]})
+        self.assertEqual(sampler.sample(now=14).core_cpu, {"cpu0": 80})
+
+    def test_core_counter_regression_requires_a_new_baseline(self):
+        self.core_stat({"cpu0": [100, 0, 0, 100, 0, 0, 0, 0]})
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        sampler.sample(now=10)
+        self.core_stat({"cpu0": [99, 0, 0, 200, 0, 0, 0, 0]})
+        self.assertEqual(sampler.sample(now=11).core_cpu, {})
+        self.core_stat({"cpu0": [179, 0, 0, 220, 0, 0, 0, 0]})
+        self.assertEqual(sampler.sample(now=12).core_cpu, {"cpu0": 80})
+
+    def test_unchanged_core_counters_do_not_fabricate_zero_utilization(self):
+        self.core_stat({"cpu0": [0] * 8})
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        sampler.sample(now=10)
+        self.assertEqual(sampler.sample(now=11).core_cpu, {})
+
+    def test_hotplugged_core_requires_baseline_without_resetting_other_cores(self):
+        self.core_stat({"cpu0": [0] * 8, "cpu1": [0] * 8})
+        sampler = metrics.ThreadSampler(self.selector(), ticks_per_second=100)
+        sampler.sample(now=10)
+        self.core_stat({"cpu0": [40, 0, 0, 60, 0, 0, 0, 0]})
+        self.assertEqual(sampler.sample(now=11).core_cpu, {"cpu0": 40})
+        self.core_stat(
+            {"cpu0": [80, 0, 0, 120, 0, 0, 0, 0], "cpu1": [900, 0, 0, 100, 0, 0, 0, 0]}
+        )
+        self.assertEqual(sampler.sample(now=12).core_cpu, {"cpu0": 40})
+        self.core_stat(
+            {"cpu0": [120, 0, 0, 180, 0, 0, 0, 0], "cpu1": [980, 0, 0, 120, 0, 0, 0, 0]}
+        )
+        self.assertEqual(sampler.sample(now=13).core_cpu, {"cpu0": 40, "cpu1": 80})
+
+    def test_core_metrics_preserve_individual_dimensions_and_collection_time(self):
+        from datetime import datetime, timezone
+
+        stamp = datetime(2026, 10, 12, tzinfo=timezone.utc)
+        sample = metrics.ThreadSample(
+            self.selector().select(), 80, 123, core_cpu={"cpu0": 80, "cpu1": 0}
+        )
+        payload = metrics.metric_data("group", "i-example", sample, timestamp=stamp)
+        cores = [
+            datum for datum in payload if datum["MetricName"] == "CPUCoreUtilization"
+        ]
+        self.assertEqual(len(cores), 2)
+        self.assertEqual(
+            [(datum["Dimensions"][-1], datum["Value"]) for datum in cores],
+            [
+                ({"Name": "Cpu", "Value": "cpu0"}, 80),
+                ({"Name": "Cpu", "Value": "cpu1"}, 0),
+            ],
+        )
+        for datum in payload:
+            self.assertEqual(
+                datum["Dimensions"][:2],
+                [
+                    {"Name": "AutoScalingGroupName", "Value": "group"},
+                    {"Name": "InstanceId", "Value": "i-example"},
+                ],
+            )
+            self.assertEqual(datum["Timestamp"], stamp)
+            self.assertEqual(datum["StorageResolution"], 1)
+        self.assertNotIn("PublisherReady", [datum["MetricName"] for datum in payload])
+
+    def test_inspection_logs_per_core_map_without_readiness_or_aws_access(self):
+        import json
+        import subprocess
+        import sys
+
+        script = Path(metrics.__file__)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--executable",
+                self.exe,
+                "--proc-root",
+                str(self.root),
+                "--inspect",
+                "--samples",
+                "2",
+                "--interval",
+                "0.001",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        samples = [
+            json.loads(line[line.index("{") :]) for line in result.stderr.splitlines()
+        ]
+        self.assertEqual(len(samples), 2)
+        self.assertIsNone(samples[0]["cpu_percent_one_vcpu"])
+        self.assertEqual(samples[1]["cpu_percent_one_vcpu"], 0)
+        for sample in samples:
+            self.assertEqual(sample["cpu_core_utilization"], {})
+            self.assertNotIn("registered_ready", sample)
 
 
 @unittest.skipUnless(Path("/proc/self/stat").exists(), "Linux procfs smoke test")

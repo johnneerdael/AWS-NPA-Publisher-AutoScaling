@@ -10,9 +10,8 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +33,7 @@ class ThreadSample:
     identity: ProcessIdentity
     cpu: float | None
     hottest_tid: int | None
+    core_cpu: dict[str, float] = field(default_factory=dict)
 
 
 def parse_stat(text: str) -> tuple[int, int]:
@@ -133,6 +133,43 @@ class ProcessSelector:
             raise CollectionError("Cannot select publisher process") from exc
 
 
+class CoreSampler:
+    """Measure each OS CPU separately; never use the aggregate procfs CPU row."""
+
+    def __init__(self, proc_root: Path):
+        self.stat_path = proc_root / "stat"
+        self.previous = {}
+
+    def sample(self) -> dict[str, float]:
+        try:
+            counters = {}
+            for line in self.stat_path.read_text().splitlines():
+                fields = line.split()
+                if not fields or not re.fullmatch(r"cpu[0-9]+", fields[0]):
+                    continue
+                # Guest counters are already included in user/nice; ignore them.
+                values = tuple(int(value) for value in fields[1:9])
+                if len(values) != 8 or min(values) < 0 or fields[0] in counters:
+                    raise ValueError("Invalid per-core CPU counters")
+                counters[fields[0]] = values
+            previous = self.previous
+            self.previous = counters
+            measured = {}
+            for cpu, values in counters.items():
+                if cpu not in previous:
+                    continue  # New/hotplugged cores need their own baseline.
+                deltas = tuple(value - old for value, old in zip(values, previous[cpu]))
+                total = sum(deltas)
+                if min(deltas) < 0 or total <= 0:
+                    continue  # Regressed/unchanged counters cannot establish CPU.
+                idle = deltas[3] + deltas[4]
+                measured[cpu] = 100 * (total - idle) / total
+            return measured
+        except (OSError, ValueError):
+            self.previous = {}
+            return {}  # Optional core telemetry must not invalidate thread CPU.
+
+
 class ThreadSampler:
     def __init__(self, selector: ProcessSelector, ticks_per_second: int | None = None):
         self.selector = selector
@@ -140,8 +177,10 @@ class ThreadSampler:
         if self.hz <= 0:
             raise ValueError("Clock ticks per second must be positive")
         self.previous = None
+        self.core_sampler = CoreSampler(selector.proc_root)
 
     def sample(self, now: float | None = None) -> ThreadSample:
+        core_cpu = self.core_sampler.sample()
         try:
             identity = self.selector.select()
             process = self.selector.proc_root / str(identity.pid)
@@ -159,13 +198,13 @@ class ThreadSampler:
             previous = self.previous
             self.previous = (identity, sampled_at, ticks)
             if previous is None or previous[0] != identity:
-                return ThreadSample(identity, None, None)
+                return ThreadSample(identity, None, None, core_cpu)
             elapsed = sampled_at - previous[1]
             if elapsed <= 0:
                 raise CollectionError("Sampling interval must be positive")
             if any(key not in previous[2] for key in ticks):
                 # An unseen live thread could be the busiest; baseline every thread.
-                return ThreadSample(identity, None, None)
+                return ThreadSample(identity, None, None, core_cpu)
             measured = []
             for key, current in ticks.items():
                 delta = current - previous[2][key]
@@ -174,59 +213,14 @@ class ThreadSampler:
                 # A thread can use at most one vCPU; jiffy rounding may overshoot.
                 measured.append((min(100.0, 100 * delta / self.hz / elapsed), key[0]))
             if not measured:
-                return ThreadSample(identity, None, None)
+                return ThreadSample(identity, None, None, core_cpu)
             cpu, tid = max(measured)
-            return ThreadSample(identity, cpu, tid)
+            return ThreadSample(identity, cpu, tid, core_cpu)
         except (OSError, ValueError, CollectionError) as exc:
             self.previous = None
             if isinstance(exc, CollectionError):
                 raise
             raise CollectionError("Cannot read publisher thread counters") from exc
-
-
-def mark_ready(
-    marker: Path, identity: ProcessIdentity, *, now: float | None = None
-) -> None:
-    """Record explicit lifecycle acknowledgement for this process incarnation."""
-    marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.NamedTemporaryFile(mode="w", dir=marker.parent, delete=False) as f:
-        temporary = Path(f.name)
-        try:
-            json.dump(
-                {
-                    "pid": identity.pid,
-                    "start_ticks": identity.start_ticks,
-                    "verified_at": time.time() if now is None else now,
-                },
-                f,
-            )
-            f.flush()
-            os.fsync(f.fileno())
-            os.replace(temporary, marker)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
-def is_ready(
-    marker: Path,
-    identity: ProcessIdentity,
-    *,
-    now: float | None = None,
-    ttl: float = 180,
-) -> bool:
-    try:
-        proof = json.loads(marker.read_text())
-        verified_at = proof["verified_at"]
-        if not isinstance(verified_at, (int, float)) or not math.isfinite(verified_at):
-            return False
-        age = (time.time() if now is None else now) - verified_at
-        return (
-            proof["pid"] == identity.pid
-            and proof["start_ticks"] == identity.start_ticks
-            and 0 <= age <= ttl
-        )
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
 
 
 def read_configuration(path: Path) -> dict:
@@ -237,8 +231,6 @@ def read_configuration(path: Path) -> dict:
         "container_name",
         "container_id",
         "proc_root",
-        "ready_file",
-        "ready_ttl",
         "group",
         "instance_id",
         "region",
@@ -282,7 +274,6 @@ def metric_data(
     instance: str,
     sample: ThreadSample | None,
     *,
-    ready: bool,
     timestamp: datetime | None = None,
 ) -> list[dict]:
     healthy = sample is not None and sample.cpu is not None
@@ -290,17 +281,24 @@ def metric_data(
         {"Name": "AutoScalingGroupName", "Value": group},
         {"Name": "InstanceId", "Value": instance},
     ]
-    data = [
-        {"MetricName": "PublisherReady", "Value": int(ready and healthy)},
-        {"MetricName": "CollectorHealthy", "Value": int(healthy)},
-    ]
+    data = [{"MetricName": "CollectorHealthy", "Value": int(healthy)}]
     if healthy:
         data.append(
             {"MetricName": "HottestThreadCPU", "Value": sample.cpu, "Unit": "Percent"}
         )
+    if sample is not None:
+        data.extend(
+            {
+                "MetricName": "CPUCoreUtilization",
+                "Value": value,
+                "Unit": "Percent",
+                "Dimensions": dimensions + [{"Name": "Cpu", "Value": cpu}],
+            }
+            for cpu, value in sample.core_cpu.items()
+        )
     for metric in data:
         metric.setdefault("Unit", "Count")
-        metric["Dimensions"] = dimensions
+        metric.setdefault("Dimensions", dimensions)
         metric["StorageResolution"] = 1
         if timestamp is not None:
             metric["Timestamp"] = timestamp
@@ -319,18 +317,14 @@ def main() -> None:
     containers.add_argument("--container-name")
     containers.add_argument("--container-id")
     parser.add_argument("--proc-root", type=Path, default=Path("/proc"))
-    parser.add_argument(
-        "--ready-file", type=Path, default=Path("/run/npa-metrics/ready.json")
-    )
-    parser.add_argument("--ready-ttl", type=float, default=180)
     parser.add_argument("--group")
     parser.add_argument("--instance-id", default="auto")
     parser.add_argument("--region", default="auto")
     parser.add_argument("--interval", type=float, default=10)
     parser.add_argument("--samples", type=int, default=0)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--inspect", action="store_true", help="Read-only; no AWS writes")
-    mode.add_argument("--mark-ready", action="store_true")
+    parser.add_argument(
+        "--inspect", action="store_true", help="Read-only; no AWS writes"
+    )
     if config_args.config:
         parser.set_defaults(**read_configuration(config_args.config))
     args = parser.parse_args()
@@ -338,9 +332,7 @@ def main() -> None:
         parser.error("Specify --executable or executable in --config")
     if not math.isfinite(args.interval) or args.interval <= 0 or args.samples < 0:
         parser.error("Interval must be positive and sample count nonnegative")
-    if not math.isfinite(args.ready_ttl) or args.ready_ttl <= 0:
-        parser.error("Ready proof lifetime must be positive")
-    if not args.inspect and not args.mark_ready:
+    if not args.inspect:
         if args.interval > 10:
             parser.error("Publishing interval must be at most 10 seconds")
         if not args.group:
@@ -359,13 +351,6 @@ def main() -> None:
         container_id=args.container_id,
         container_name=args.container_name,
     )
-    if args.mark_ready:
-        identity = selector.select()
-        mark_ready(args.ready_file, identity)
-        print(
-            json.dumps({"ready_pid": identity.pid, "start_ticks": identity.start_ticks})
-        )
-        return
     cloudwatch = None
     if not args.inspect:
         import boto3
@@ -385,17 +370,15 @@ def main() -> None:
     next_sample = time.monotonic()
     while True:
         sample = None
-        ready = False
         try:
             sample = sampler.sample()
-            ready = is_ready(args.ready_file, sample.identity, ttl=args.ready_ttl)
             LOG.info(
                 json.dumps(
                     {
                         "pid": sample.identity.pid,
                         "hottest_tid": sample.hottest_tid,
                         "cpu_percent_one_vcpu": sample.cpu,
-                        "registered_ready": ready,
+                        "cpu_core_utilization": sample.core_cpu,
                     }
                 )
             )
@@ -410,7 +393,6 @@ def main() -> None:
                         args.group,
                         args.instance_id,
                         sample,
-                        ready=ready,
                         timestamp=timestamp,
                     ),
                 )
