@@ -60,3 +60,8 @@ config
 htmlcov/
 *.cover
 /scripts/NPAPublisherAutoscalling/
+
+# Local controller/collector deployment inputs
+.venv/
+collector-config.json
+controller-parameters.json

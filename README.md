@@ -1,277 +1,95 @@
-# Netskope Private Access Publisher with Amazon EC2 Auto Scaling
+# Preventive autoscaling for NPA publisher threads
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+This fork adds capacity before the busiest Netskope Private Access publisher
+thread saturates one vCPU. Existing sticky connections stay on their publisher;
+new connections can use ready publishers with headroom.
 
-## Overview
+The controller uses the highest individual publisher thread CPU. A second idle
+core or a low fleet average cannot hide a hot publisher.
 
-This solution provides automated, cost-optimized deployment of Netskope Private Access (NPA) Publishers using Amazon EC2 Auto Scaling. It eliminates manual publisher lifecycle management through event-driven automation and provides dynamic scaling based on CPU utilization.
+| Default condition | Required headroom |
+|---|---|
+| One publisher at or above 70% in two closed minutes | One ready publisher at or below 40% |
+| Any publisher at or above 80% in the latest closed minute | Two ready publishers at or below 40% |
+| Enough ready headroom already exists | Hold capacity, even while sticky load stays hot |
+| Capacity is launching, telemetry is incomplete, or cooldown is active | Hold and report the reason |
+| Required headroom exceeds the ASG maximum | Add only permitted capacity and alert |
 
-**Key Benefits:**
-- **Automated Scaling:** Publishers automatically scale up/down based on CPU demand
-- **Zero-Touch Operations:** Event-driven Lambda functions handle publisher registration/deregistration with Netskope API
-- **Cost Optimization:** Pay only for capacity you need (scales down during low traffic)
-- **High Availability:** Multi-AZ deployment with automatic instance replacement
-- **Secure by Design:** No public IPs, egress-only security groups, encrypted secrets storage
+The CPU percentages represent **one vCPU**, independent of the instance's core
+count. These thresholds are starting values, not a throughput guarantee. Tune
+against measured CPU growth and launch-to-ready time. Spare capacity helps only
+if the NPA routing layer sends new connections to eligible cool publishers.
 
-## Solution Architecture
+## Components
 
-The solution deploys:
-- Amazon EC2 Auto Scaling Group with CPU-based scaling policies (default: 70% target)
-- AWS Lambda functions for automated publisher lifecycle management via Netskope REST API v2
-- Amazon EventBridge rules triggering Lambda on launch/terminate events
-- Auto Scaling Lifecycle Hooks for graceful publisher registration/deregistration
-- AWS Secrets Manager for secure API token storage
-- IAM roles with least privilege permissions
-- VPC Security Group with egress-only access
+- **Linux host collector:** Reads each publisher thread's user/system CPU time
+  under `/proc`. Select one exact executable, optionally within a named Docker
+  container. Publish CPU, collector health, and explicit registration readiness
+  every 10 seconds. No publisher binary changes are required.
+- **Scheduled controller:** Checks current ASG members and closed CloudWatch
+  periods every minute. Add only the missing ready headroom. Require six samples
+  in each minute, serialize requests, honor a durable cooldown, and respect the
+  ASG maximum. Never infer readiness from an idle CPU reading.
+- **CloudFormation add-on:** Deploy the controller, state, and alarms against an
+  **existing verified publisher ASG**. Default to observation-only. The add-on
+  does not create publishers or replace their registration workflow.
 
-![Architecture Diagram](docs/media/architecture-diagram.png)
+Automatic scale-in is deliberately absent. Remove publishers only through a
+verified draining procedure. The controller must be the group's sole capacity
+writer when enabled; it rejects existing scaling policies and scheduled actions.
 
-## Quick Start
+## Start here
 
-### Prerequisites
+Read [deployment and qualification](docs/PUBLISHER_THREAD_SCALING.md) for host
+installation, readiness integration, permissions, packaging, observation, and
+enabling scaling. Read [the design](docs/PUBLISHER_THREAD_SCALING_DESIGN.md) for
+constraints and implementation scope.
 
-- **AWS Account** with appropriate permissions
-- **Amazon VPC** with 2+ subnets in different Availability Zones
-- **Outbound Connectivity** to Netskope NewEdge platform (via NAT Gateway or IPsec)
-- **AWS Systems Manager** enabled for EC2 management
-- **Netskope API v2 Token** with infrastructure and application management permissions
-- **NPA Publisher AMI ID** for your AWS region (available on AWS Marketplace)
-
-### Deployment Steps
-
-1. **Get Netskope Publisher AMI ID**
-
-   Netskope does not typically publish a public, static table of AMI IDs because these IDs change frequently as the Publisher is updated (the current version is based on Ubuntu 22.04).
-
-   Instead, you can find the current AMI ID for your specific region using one of the three methods below:
-
-   **Method 1: Using the AWS Management Console (Recommended)**
-
-   This is the most reliable way to find the regional AMI for your specific account.
-
-   - Sign in to your AWS Console and switch to the Region where you want to deploy
-   - Navigate to EC2 > AMI Catalog
-   - Click on the AWS Marketplace AMIs tab
-   - Search for "Netskope Private Access Publisher"
-   - Select the product; the specific AMI ID for that region will be displayed in the launch details or once you click "Continue to Launch"
-
-   **Method 2: Using the Netskope Tenant UI**
-
-   If you are already logged into your Netskope environment:
-
-   - Go to Settings > Security Cloud Platform > Publishers
-   - Click the Publisher AMI button (usually located in the top right or within the "New Publisher" setup flow)
-   - This link typically redirects you to the AWS Marketplace page, which automatically detects your region and shows the corresponding ID
-
-   **Method 3: Programmatic Lookup (Terraform/CLI)**
-
-   Use a filter to find the latest image:
-
-   ```bash
-   aws ec2 describe-images \
-       --owners aws-marketplace \
-       --filters "Name=name,Values=*Netskope Private Access Publisher*" \
-       --region <your-region> \
-       --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-       --output text
-   ```
-
-2. **Configure Parameters**
-   - Netskope Tenant FQDN (e.g., `mytenant.goskope.com`)
-   - VPC and Subnet IDs (minimum 2 subnets in different AZs)
-   - NPA Publisher Group Name
-   - Min/Max/Desired capacity (recommended: min 2, max 10)
-   - API Token (new or existing Secrets Manager ARN)
-
-3. **Deploy CloudFormation Stack**
-   ```bash
-   aws cloudformation create-stack \
-     --stack-name netskope-npa-publisher \
-     --template-body file://templates/npa-publisher-autoscaling.yaml \
-     --parameters file://parameters.json \
-     --capabilities CAPABILITY_NAMED_IAM
-   ```
-
-4. **Verify Deployment**
-   - Check CloudFormation stack status: `CREATE_COMPLETE`
-   - Verify Auto Scaling Group has launched instances
-   - Check Lambda function logs in CloudWatch
-   - Confirm publishers registered in Netskope tenant
-
-> **For detailed step-by-step instructions with screenshots, see the [Detailed Deployment Guide](docs/DEPLOYMENT_GUIDE.md)**
-
-### Naming Convention Requirement
-
-**CRITICAL:** This solution requires specific naming conventions to function properly. Private Applications in Netskope must follow this naming pattern:
-
-```
-Auto Scaling Group Name: MyNPAPublisherGroup
-Valid App Names: MyNPAPublisherGroup-App1
-                 MyNPAPublisherGroup-WebServer
-                 MyNPAPublisherGroup-Database
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/cfn-lint templates/publisher-thread-scaling.yaml
+python3 scripts/package-controller.py dist/controller.zip
 ```
 
-The Lambda function uses this prefix matching to identify which apps belong to this publisher group for automatic configuration updates.
+Deployment uses `templates/publisher-thread-scaling.yaml`. Upload the locally
+built ZIP to an operator-owned regional S3 bucket and pass its immutable key to
+the stack. No dependency on an upstream-owned Lambda deployment bucket exists.
 
-> **For detailed naming convention requirements and modification instructions, see:** [DevOps Notes - Naming Convention Requirement](docs/DEVOPS_NOTES.md#naming-convention-requirement)
+## Validation status
 
-## Documentation
+Unit and AWS SDK adapter tests cover threshold persistence, sticky-load headroom,
+thread/process restarts, Docker selection, missing and sparse telemetry, readiness
+expiry, cooldown contention, concurrent capacity changes, and observation safety.
+CI also tests real Linux `/proc` CPU sampling, packages the reviewed source, and
+checks the supported template and Python code.
 
-- **[Deployment Guide](docs/DEPLOYMENT_GUIDE.md)** - Detailed step-by-step deployment instructions with screenshots
-- **[DevOps Notes](docs/DEVOPS_NOTES.md)** - Technical solution overview, architecture details, AWS services used
-- **[NPA HA Strategies](docs/NPA_AWS_HA_STRATEGIES.md)** - High availability design patterns
+A read-only Frankfurt check identified `/home/npa_publisher` inside Docker with
+two OS threads and confirmed the collector can sample both. That publisher was
+idle during the check. This establishes compatibility with that process layout;
+it does not establish loaded throughput, ASG registration, routing, or production
+readiness. No AWS stack or tenant configuration was changed.
 
-## Project Structure
+## Upstream implementation
 
-```
-/
-├── templates/                          # CloudFormation templates
-│   └── npa-publisher-autoscaling.yaml  # Main template
-├── scripts/                            # Lambda function code
-│   ├── lambda_function.py              # Lifecycle management function
-│   └── NPAPublisherAutoscalling.zip    # Packaged Lambda deployment
-├── docs/                               # Documentation
-│   ├── DEPLOYMENT_GUIDE.md             # Detailed deployment guide with screenshots
-│   ├── DEVOPS_NOTES.md                 # Technical overview
-│   └── media/                          # Architecture diagrams and screenshots
-├── .gitignore                          # Git ignore rules
-├── LICENSE                             # Apache 2.0 license
-└── README.md                           # This file
-```
+The original upstream implementation remains at
+`templates/npa-publisher-autoscaling.yaml`; its original documentation is in
+`docs/DEPLOYMENT_GUIDE.md`, `docs/DEVOPS_NOTES.md`, and
+`docs/NPA_AWS_HA_STRATEGIES.md`. Treat these as historical reference.
 
-## Features
+The original template uses `ASGAverageCPUUtilization` at 70% on a two-vCPU
+`t3.large`. A single saturated thread contributes roughly 50% EC2 instance CPU,
+so the default can miss saturation. Its checked-in lifecycle Lambda and ZIP
+handle CloudWatch log forwarding, not the documented publisher registration
+flow; the original template instead references a separately hosted S3 ZIP whose
+contents are not verified here. Current cfn-lint also reports E3712 for its
+initial zero-capacity ASG. This fork's supported add-on avoids those dependencies
+and requires an independently verified publisher lifecycle integration.
 
-### Dynamic Scaling
-- CPU-based target tracking scaling policy
-- Configurable thresholds (default: 70% CPU)
-- Cooldown period: 5 minutes between scaling events
-- Graceful scale-in with lifecycle hooks
-
-### Automated Publisher Management
-- Automatic registration with Netskope on instance launch
-- Automatic deregistration on instance termination
-- Automatic private application configuration updates
-- SSM Run Command for secure publisher provisioning
-
-### Security & Compliance
-- No public IP addresses assigned to publishers
-- Security group with zero ingress rules (egress only)
-- API tokens stored in AWS Secrets Manager
-- IAM roles following least privilege principle
-- Access via AWS Systems Manager Session Manager
-- VPC-based network isolation
-
-### High Availability
-- Multi-AZ deployment support
-- Automatic instance health checks
-- Failed instance replacement
-- Configurable minimum capacity (recommended: 2)
-
-### Cost Optimization
-- Scale down during low traffic periods
-- Configurable capacity limits
-- Resource tagging for cost allocation
-- Right-sized instance types (t3.large default)
-
-## Cost Estimation
-
-| Deployment Size | Instances | Estimated Monthly Cost* |
-|-----------------|-----------|------------------------|
-| Small           | 2-4       | $200-400               |
-| Medium          | 4-8       | $400-800               |
-| Large           | 8-16      | $800-1,600             |
-
-*Costs include EC2 (t3.large), NAT Gateway, Lambda, Secrets Manager. Actual costs vary by region, data transfer, and usage patterns.
-
-## Multi-Region Deployment
-
-Deploy the same Auto Scaling Group name in multiple AWS regions to provide:
-- Geographic redundancy
-- Disaster recovery
-- Lower latency for global users
-
-Example:
-```
-Publisher Group: MyNPAPublisher
-├─ us-east-1: 2-5 instances
-├─ us-west-2: 2-5 instances
-└─ eu-west-1: 2-5 instances
-
-All serve: MyNPAPublisher-App1, MyNPAPublisher-App2
-```
-
-## Monitoring
-
-### CloudWatch Metrics
-- Auto Scaling Group CPU utilization
-- Instance count (min/max/desired/current)
-- Scaling activity history
-- Lambda function invocations and errors
-
-### CloudWatch Logs
-- Lambda function execution logs
-- Publisher registration/deregistration events
-- SSM Run Command output
-- API call responses and errors
-
-### Recommended Alarms
-- High CPU utilization (>80% for 10 minutes)
-- Lambda function errors
-- Auto Scaling Group capacity at maximum
-- Failed publisher registrations
-
-## Troubleshooting
-
-### Publishers Not Registering
-1. Check Lambda function logs in CloudWatch
-2. Verify Netskope API token has correct permissions
-3. Check VPC connectivity to Netskope NewEdge
-4. Verify SSM agent running on EC2 instances
-
-### Scaling Not Working
-1. Check Auto Scaling Group scaling policies
-2. Verify CloudWatch metrics are being received
-3. Review scaling activity history
-4. Check lifecycle hook timeouts
-
-### Private Apps Not Updated
-1. Verify app names follow naming convention
-2. Check Lambda function has app management permissions
-3. Review Lambda logs for API call errors
-
-See [DevOps Notes](docs/DEVOPS_NOTES.md) for detailed resolution steps.
-
-## Support
-
-For issues, questions, or contributions:
-- **GitHub Issues:** [Report a bug or request a feature](https://github.com/netskopeoss/AWS-NPA-Publisher-AutoScaling/issues)
-- **Netskope Docs:** [Private Access Documentation](https://docs.netskope.com/en/netskope-private-access.html)
-- **Netskope API:** [REST API v2 Documentation](https://docs.netskope.com/en/rest-api-v2-overview-312207.html)
+See [AWS target tracking metric semantics](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-scaling-target-tracking.html)
+and [EC2 CPU accounting](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/burstable-credits-baseline-concepts.html).
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
-Please ensure:
-- CloudFormation templates pass cfn-lint validation
-- Code follows security best practices
-- Documentation is updated
-- Changes are tested in a non-production environment
-
-## Acknowledgments
-
-- Built for integration with [Netskope Private Access](https://www.netskope.com/products/private-access)
-
----
-
-**Maintained by:** Netskope OSS Community
-**Version:** 1.0
-**Last Updated:** 2025-12-16
+Apache-2.0, inherited from [netskopeoss/AWS-NPA-Publisher-AutoScaling](https://github.com/netskopeoss/AWS-NPA-Publisher-AutoScaling).

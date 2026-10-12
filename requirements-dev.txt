@@ -1,0 +1,7 @@
+-r requirements.txt
+cfn-lint>=1.57,<2
+PyYAML>=6,<7
+black>=26,<27
+flake8>=7,<8
+bandit>=1.9,<2
+detect-secrets>=1.5,<2

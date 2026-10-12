@@ -1,3 +1,5 @@
+> Historical upstream reference. Use [the thread-scaling guide](PUBLISHER_THREAD_SCALING.md) for this fork’s supported add-on. The original lifecycle bundle is unverified and its average-CPU policy can miss a saturated publisher thread.
+
 # High Availability Strategies for Netskope Private Access Publishers in AWS
 
 ## Table of Contents

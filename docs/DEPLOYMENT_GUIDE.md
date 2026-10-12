@@ -1,3 +1,5 @@
+> Historical upstream reference. Use [the thread-scaling guide](PUBLISHER_THREAD_SCALING.md) for this fork’s supported add-on. The original lifecycle bundle is unverified and its average-CPU policy can miss a saturated publisher thread.
+
 \# Deploying Netskope Private Access Publisher with Amazon EC2 Auto Scaling
 
 This document will guide you how to deploy Netskope Private Access Amazon EC2 Auto Scaling.
